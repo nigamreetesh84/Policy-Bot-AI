@@ -1,50 +1,86 @@
 import streamlit as st
+import time, tempfile, os, numpy as np, pandas as pd
 from ingest import process_multiple_pdfs
 from generate import answer_with_openai
-import os
+from cache import SimpleCache
+from search import retrieve
 
-# App title and description
-st.set_page_config(page_title="PolicyBot AI", page_icon="🤖")
-st.title("🤖 PolicyBot AI")
-st.caption("An AI-powered RAG assistant for understanding insurance policy documents.")
+# ---------------------- PAGE CONFIG ----------------------
+st.set_page_config(page_title="PolicyBot AI", page_icon="🤖", layout="wide")
+st.title("🤖 PolicyBot AI: Multi-Document RAG Assistant")
+st.caption("Upload insurance policies and ask questions. The assistant retrieves relevant sections and answers intelligently.")
 
-# Directory setup
-os.makedirs("data", exist_ok=True)
-os.makedirs("feedback", exist_ok=True)
+st.markdown("""
+<style>
+.stExpander {border:1px solid #ccc;border-radius:10px;}
+</style>
+""", unsafe_allow_html=True)
 
-# Step 1: Upload multiple PDFs
-st.header("📂 Upload Policy Documents")
-uploaded_files = st.file_uploader("Upload one or more PDF files", type=["pdf"], accept_multiple_files=True)
+# ---------------------- SIDEBAR ----------------------
+st.sidebar.header("📂 Upload Policy Documents")
+uploaded_files = st.sidebar.file_uploader("Upload one or more PDF files", type=["pdf"], accept_multiple_files=True)
 
-if uploaded_files:
-    paths = []
-    for file in uploaded_files:
-        save_path = os.path.join("data", file.name)
-        with open(save_path, "wb") as f:
-            f.write(file.getbuffer())
-        paths.append(save_path)
-    process_multiple_pdfs(paths)
-    st.success(f"✅ {len(paths)} document(s) ingested successfully!")
+if "processed" not in st.session_state:
+    st.session_state.processed = False
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
-# Step 2: Ask a question
-st.header("💬 Ask a Question")
-query = st.text_input("Type your question here (e.g., 'What is the benefit limit for accidental death?')")
+if uploaded_files and st.sidebar.button("🚀 Process Documents"):
+    temp_paths = []
+    with st.spinner("Processing and embedding PDFs..."):
+        for uf in uploaded_files:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(uf.getbuffer())
+                temp_paths.append(tmp.name)
+        process_multiple_pdfs(temp_paths)
+        for p in temp_paths:
+            try: os.remove(p)
+            except: pass
+    st.session_state.processed = True
+    st.sidebar.success("✅ Documents processed successfully!")
 
-if st.button("Generate Answer") and query:
-    with st.spinner("Generating answer using PolicyBot AI..."):
-        answer = answer_with_openai(query)
-        st.markdown(answer)
+# ---------------------- MAIN CHAT SECTION ----------------------
+st.subheader("💬 Ask a Question")
 
-    # Step 3: Feedback section
-    st.markdown("---")
-    st.subheader("🗳️ Was this answer helpful?")
-    col1, col2 = st.columns(2)
-    if col1.button("👍 Helpful"):
-        with open("feedback/feedback_log.csv", "a") as f:
-            f.write(f"{query},Helpful\n")
-        st.toast("Thanks for your feedback!", icon="✅")
+if not st.session_state.processed:
+    st.info("Please upload and process policy documents first.")
+else:
+    user_input = st.text_input("Ask your question about the uploaded policies:")
+    if user_input:
+        cache = SimpleCache()
+        start = time.time()
 
-    if col2.button("👎 Not Helpful"):
-        with open("feedback/feedback_log.csv", "a") as f:
-            f.write(f"{query},Not Helpful\n")
-        st.toast("Thanks! We'll keep improving.", icon="⚙️")
+        st.chat_message("user").markdown(user_input)
+        st.session_state.chat_history.append({"role": "user", "content": user_input})
+
+        cached = cache.get(user_input)
+        if cached:
+            # Support both old (string) and new (tuple) cache formats
+            if isinstance(cached, tuple) and len(cached) == 2:
+                answer, formatted_context = cached
+            else:
+                answer, formatted_context = cached, ""
+            cache_status = "🟢 Cache HIT"
+        else:
+            with st.spinner("🤖 Retrieving and generating..."):
+                answer, formatted_context = answer_with_openai(user_input)
+                cache.set(user_input, (answer, formatted_context))
+            cache_status = "🔵 Cache MISS"
+
+        elapsed = time.time() - start
+
+        # --- Display Assistant Response ---
+        with st.chat_message("assistant"):
+            st.markdown(f"### 🧠 Answer\n{answer}")
+            with st.expander("📘 Supporting Evidence", expanded=False):
+                st.markdown(formatted_context)
+
+        st.caption(f"{cache_status} | ⏱ {elapsed:.2f}s")
+        st.session_state.chat_history.append({"role": "assistant", "content": answer})
+
+# ---------------------- CHAT HISTORY ----------------------
+if st.session_state.chat_history:
+    st.divider()
+    st.subheader("🕒 Conversation History")
+    for msg in st.session_state.chat_history:
+        st.chat_message(msg["role"]).markdown(msg["content"])

@@ -1,60 +1,63 @@
-# ingest.py
-import os, re
-from sentence_transformers import SentenceTransformer
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-import os, warnings
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
-warnings.filterwarnings("ignore", message="Cannot copy out of meta tensor")
 
+import os, tempfile, uuid
 from tqdm import tqdm
 from chromadb import PersistentClient
-from config import CHUNK_SIZE, CHUNK_OVERLAP, CHROMA_DIR, EMBED_MODEL
-
-def clean_text(s: str) -> str:
-    """Remove unwanted artifacts and normalize whitespace."""
-    s = s.replace('\n', ' ')
-    s = re.sub(r'\s+', ' ', s)
-    s = re.sub(r'This page left blank intentionally', '', s, flags=re.I)
-    return s.strip()
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from sentence_transformers import SentenceTransformer
+from config import CHROMA_DIR, EMBED_MODEL, CHUNK_SIZE, CHUNK_OVERLAP
 
 def extract_pdf_chunks(pdf_path):
-    """Load a PDF and split into cleaned text chunks."""
     loader = PyPDFLoader(pdf_path)
-    documents = loader.load()
-    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-    chunks = splitter.split_documents(documents)
+    docs = loader.load()
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+    )
+    chunks = splitter.split_documents(docs)
+    texts = [c.page_content for c in chunks]
+    metas = [c.metadata for c in chunks]
+    return texts, metas
 
-    texts, metadata = [], []
-    for idx, chunk in enumerate(chunks):
-        text = clean_text(chunk.page_content)
-        meta = chunk.metadata.copy()
-        meta["chunk_id"] = f"{os.path.basename(pdf_path)}_chunk_{idx}"
-        meta["source"] = os.path.basename(pdf_path)
-        texts.append(text)
-        metadata.append(meta)
-    return texts, metadata
-
-def build_embeddings(texts):
-    """Generate dense embeddings using SentenceTransformer."""
-    model = SentenceTransformer(EMBED_MODEL)
-    return model.encode(texts, show_progress_bar=True, convert_to_numpy=True)
-
-def upsert_chroma(texts, metadata, embeddings):
-    """Persist embeddings into ChromaDB."""
+def process_multiple_pdfs(pdf_files):
+    """Process and embed PDFs into Chroma DB."""
     client = PersistentClient(path=CHROMA_DIR)
     collection = client.get_or_create_collection("policy_chunks")
-    ids = [m["chunk_id"] for m in metadata]
-    collection.add(documents=texts, metadatas=metadata, embeddings=embeddings.tolist(), ids=ids)
-    print(f"✅ Stored {len(texts)} chunks to {CHROMA_DIR}")
+    model = SentenceTransformer(EMBED_MODEL)
 
-def process_multiple_pdfs(pdf_paths):
-    """End-to-end ingestion for multiple PDFs."""
-    all_texts, all_meta = [], []
-    for pdf in pdf_paths:
-        texts, meta = extract_pdf_chunks(pdf)
+    all_texts, all_meta, all_ids = [], [], []
+
+    for f in tqdm(pdf_files, desc="Batches"):
+        # Handle UploadedFile or file path
+        if hasattr(f, "getbuffer"):
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(f.getbuffer())
+                fpath = tmp.name
+        else:
+            fpath = f
+
+        texts, meta = extract_pdf_chunks(fpath)
+
+        # Generate unique IDs for chunks
+        chunk_ids = [str(uuid.uuid4()) for _ in texts]
+
         all_texts.extend(texts)
         all_meta.extend(meta)
-    embeddings = build_embeddings(all_texts)
-    upsert_chroma(all_texts, all_meta, embeddings)
+        all_ids.extend(chunk_ids)
+
+        try:
+            os.remove(fpath)
+        except:
+            pass
+
+    embeds = model.encode(all_texts, show_progress_bar=True)
+
+    # ✅ FIX: include 'ids' argument
+    collection.add(
+        ids=all_ids,
+        documents=all_texts,
+        embeddings=embeds.tolist(),
+        metadatas=all_meta,
+    )
+
+    print(f"✅ Stored {len(all_texts)} chunks to {CHROMA_DIR}")
